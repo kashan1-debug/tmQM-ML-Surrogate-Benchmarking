@@ -24,7 +24,7 @@ $$\text{HOMO--LUMO Gap} = E_{\text{LUMO}} - E_{\text{HOMO}}$$
 | :--- | :--- | :---: | :---: |
 | **Linear Regression Baseline** | Raw Tabular | 0.085 | 0.0321 |
 | **XGBoost Regressor** | Raw Tabular | **0.294** | 0.0282 |
-| **Random Forest Regressor** | Physical Descriptors | **0.738** | **0.0172** |
+| **Random Forest Regressor** | Physical Descriptors | **0.743** | **0.0172** |
 
 ### Key Physical Insights
 * **Primary Feature Drivers:** Partial charge on the central metal (`Metal_q`, weight $\approx 0.26$) and total electronic energy (`Electronic_E`, weight $\approx 0.21$) are the single most influential global descriptors for predicting orbital splitting.
