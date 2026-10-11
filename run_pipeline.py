@@ -1,196 +1,210 @@
+#!/usr/bin/env python3
+"""
+Benchmarking ML models for HOMO-LUMO gap prediction on the tmQM 2024 dataset.
+
+This pipeline is intentionally strict:
+  - It uses only the 2024 tmQM release (108,541 unique complexes).
+  - It fails loudly if the tmQM repository cannot be cloned.
+  - It never substitutes synthetic or fallback data.
+  - It excludes all columns that could leak target information.
+
+Outputs:
+  results.csv                    - benchmark R2 and RMSE for each model
+  tmqm_correlation_matrix.png    - Pearson correlation heatmap
+  feature_importance.png         - Random Forest descriptor ranking (sorted)
+  real_parity_plot.png           - Random Forest parity plot (DFT vs. ML)
+"""
+
 import os
-import glob
+import sys
 import subprocess
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
-from xgboost import XGBRegressor
 from sklearn.metrics import r2_score, root_mean_squared_error
 
-# ==============================================================================
-# 1. AUTOMATED REPOSITORY CLONING & AGGREGATION
-# ==============================================================================
-repo_dir = "tmqm"
+try:
+    from xgboost import XGBRegressor
+    HAS_XGB = True
+except ImportError:
+    HAS_XGB = False
+    print("WARNING: xgboost not installed. Run: pip install xgboost")
 
-if not os.path.exists(repo_dir):
-    print("Cloning tmQM repository...")
-    subprocess.run(["git", "clone", "https://github.com/uiocompcat/tmqm.git"], check=True)
-else:
-    print("tmQM repository already cloned.")
 
-# Locate all CSV or TXT property files in the repository
-csv_files = glob.glob("tmqm/**/*.csv", recursive=True) + glob.glob("tmqm/**/*.txt", recursive=True)
+# ======================================================================
+# Step 1 — Clone and load the tmQM 2024 release
+# ======================================================================
+REPO_DIR = "tmqm"
+CSV_PATH = os.path.join(REPO_DIR, "tmQM", "tmQM_y.csv")
 
-df_list = []
-for file in csv_files:
-    try:
-        temp_df = pd.read_csv(file, sep=';')
-        if len(temp_df.columns) <= 1:
-            temp_df = pd.read_csv(file, sep=r'\s+')
-        df_list.append(temp_df)
-    except Exception:
-        continue
+if not os.path.exists(REPO_DIR):
+    print("Cloning tmQM repository ...")
+    result = subprocess.run(
+        ["git", "clone", "--depth", "1",
+         "https://github.com/uiocompcat/tmqm.git", REPO_DIR],
+    )
+    if result.returncode != 0:
+        sys.exit("ERROR: git clone failed. Refusing to continue without real data.")
 
-if not df_list:
-    raise FileNotFoundError("No property CSV/TXT files found inside the tmqm repository.")
+if not os.path.exists(CSV_PATH):
+    sys.exit(f"ERROR: expected data file not found at {CSV_PATH}.")
 
-df = pd.concat(df_list, ignore_index=True).drop_duplicates()
-print(f"Successfully aggregated dataset from repository files. Total Rows: {len(df)}")
+df = pd.read_csv(CSV_PATH, sep=";")
+print(f"Loaded tmQM 2024 release: {len(df):,} rows, {df.shape[1]} columns")
 
-# Standardize column names
-col_map = {c: c.strip() for c in df.columns}
-df.rename(columns=col_map, inplace=True)
 
-# Identify target column or calculate HOMO-LUMO Gap
-target_col = None
-possible_gap_cols = ['HOMO_LUMO_Gap', 'Gap', 'HOMO-LUMO_gap', 'gap']
+# ======================================================================
+# Step 2 — Explicit feature/target split (no leakage)
+# ======================================================================
+FEATURES = ["Electronic_E", "Dispersion_E", "Dipole_M", "Metal_q", "Polarizability"]
+TARGET   = "HL_Gap"
 
-for col in possible_gap_cols:
-    if col in df.columns:
-        target_col = col
-        break
+missing = [c for c in FEATURES + [TARGET] if c not in df.columns]
+if missing:
+    sys.exit(f"ERROR: missing expected columns: {missing}")
 
-if target_col is None:
-    homo_col = next((c for c in df.columns if 'HOMO' in c.upper() and 'LUMO' not in c.upper()), None)
-    lumo_col = next((c for c in df.columns if 'LUMO' in c.upper() and 'HOMO' not in c.upper()), None)
-    
-    if homo_col and lumo_col:
-        df['HOMO_LUMO_Gap'] = df[lumo_col].astype(float) - df[homo_col].astype(float)
-        target_col = 'HOMO_LUMO_Gap'
-        print(f"Calculated HOMO-LUMO Gap using columns: {lumo_col} - {homo_col}")
+X = df[FEATURES].apply(pd.to_numeric, errors="coerce")
+y = pd.to_numeric(df[TARGET], errors="coerce")
 
-if target_col is None or target_col not in df.columns:
-    print("Warning: Target gap column not found. Initializing target array from numeric energy features...")
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-    if len(numeric_cols) >= 2:
-        df['HOMO_LUMO_Gap'] = df[numeric_cols[1]] - df[numeric_cols[0]]
-        target_col = 'HOMO_LUMO_Gap'
+mask = X.notna().all(axis=1) & y.notna()
+X = X[mask].reset_index(drop=True)
+y = y[mask].reset_index(drop=True)
 
-df = df.dropna(subset=[target_col]).copy()
+print(f"Features ({len(FEATURES)}): {FEATURES}")
+print(f"Target:                {TARGET}")
+print(f"Final dataset: X={X.shape}  y={y.shape}")
 
-# ==============================================================================
-# 2. FEATURE ENCODING & CORRELATION MATRIX
-# ==============================================================================
-categorical_cols = [c for c in ['Metal', 'Symmetry', 'Space_Group'] if c in df.columns]
-df_encoded = pd.get_dummies(df, columns=categorical_cols, drop_first=False)
 
+# ======================================================================
+# Step 3 — Train models
+# ======================================================================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+print(f"Train rows: {len(X_train):,}   Test rows: {len(X_test):,}")
+
+models = {
+    "Linear Regression Baseline": LinearRegression(),
+    "Random Forest Regressor":    RandomForestRegressor(
+                                      n_estimators=100,
+                                      random_state=42,
+                                      n_jobs=-1,
+                                  ),
+}
+if HAS_XGB:
+    models["XGBoost Regressor"] = XGBRegressor(
+        n_estimators=100,
+        learning_rate=0.1,
+        random_state=42,
+        n_jobs=-1,
+    )
+
+results = []
+preds = {}
+
+for name, model in models.items():
+    print(f"Training: {name} ...")
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    preds[name] = y_pred
+    results.append({
+        "Model": name,
+        "R2":    r2_score(y_test, y_pred),
+        "RMSE":  root_mean_squared_error(y_test, y_pred),
+    })
+
+results_df = pd.DataFrame(results).sort_values("R2", ascending=False)
+
+print()
+print("=" * 60)
+print("BENCHMARK PERFORMANCE RESULTS")
+print("=" * 60)
+print(results_df.to_string(index=False, float_format=lambda v: f"{v:.6f}"))
+print()
+
+results_df.to_csv("results.csv", index=False)
+print("Saved: results.csv")
+
+
+# ======================================================================
+# Step 4 — Figures
+# ======================================================================
+sns.set_theme(style="ticks")
+plt.rcParams.update({
+    "font.family":       "sans-serif",
+    "font.weight":       "bold",
+    "axes.labelweight":  "bold",
+    "axes.titleweight":  "bold",
+    "axes.edgecolor":    "#000000",
+    "axes.linewidth":    1.0,
+})
+
+# ---- 4a. Correlation matrix -----------------------------------------
 plt.figure(figsize=(10, 6))
-sns.heatmap(df_encoded.corr(numeric_only=True), annot=True, cmap='coolwarm', fmt=".2f", linewidths=0.5)
+sns.heatmap(
+    pd.concat([X, y], axis=1).corr(),
+    annot=True, cmap="coolwarm", fmt=".2f", linewidths=0.5,
+)
 plt.title("tmQM Feature Correlation Matrix", fontsize=14)
 plt.tight_layout()
 plt.savefig("tmqm_correlation_matrix.png", dpi=300)
 plt.close()
+print("Saved: tmqm_correlation_matrix.png")
 
-df_encoded.to_csv("clean_tmqm.csv", index=False)
-
-# ==============================================================================
-# 3. BENCHMARK MODEL TRAINING
-# ==============================================================================
-leakage_candidates = ['HOMO', 'LUMO', 'Gap', 'CSD', 'code', 'identifier', 'id', 'CSD_code', target_col]
-drop_cols = [c for c in df_encoded.columns if any(leak in c for leak in leakage_candidates)]
-
-X = df_encoded.select_dtypes(include=[np.number]).drop(columns=[c for c in drop_cols if c in df_encoded.columns], errors='ignore')
-y = df_encoded[target_col].values
-
-X = X.fillna(X.mean()).replace([np.inf, -np.inf], 0)
-
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-print(f"\nFeatures Matrix Shape: {X.shape}")
-print(f"Target Array Shape: {y.shape}")
-
-lr_model = LinearRegression().fit(X_train, y_train)
-rf_model = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1).fit(X_train, y_train)
-xgb_model = XGBRegressor(n_estimators=100, learning_rate=0.1, random_state=42).fit(X_train, y_train)
-
-results = pd.DataFrame({
-    'Model': ['Linear Regression Baseline', 'Random Forest Regressor', 'XGBoost Regressor'],
-    'R² Score': [
-        r2_score(y_test, lr_model.predict(X_test)),
-        r2_score(y_test, rf_model.predict(X_test)),
-        r2_score(y_test, xgb_model.predict(X_test))
-    ],
-    'RMSE': [
-        root_mean_squared_error(y_test, lr_model.predict(X_test)),
-        root_mean_squared_error(y_test, rf_model.predict(X_test)),
-        root_mean_squared_error(y_test, xgb_model.predict(X_test))
-    ]
-})
-
-print("\n=== BENCHMARK PERFORMANCE RESULTS ===")
-print(results.to_string(index=False))
-
-# Feature Importance Plot
-importances = rf_model.feature_importances_
-feature_names = X.columns
-
+# ---- 4b. Feature importance (sorted descending) ----------------------
+rf = models["Random Forest Regressor"]
+importances = pd.Series(rf.feature_importances_, index=FEATURES).sort_values()
 plt.figure(figsize=(8, 4))
-plt.barh(feature_names[:15], importances[:15], color='teal')
+plt.barh(importances.index, importances.values, color="teal")
 plt.xlabel("Feature Importance Weight")
 plt.title("Random Forest Descriptor Ranking")
 plt.tight_layout()
 plt.savefig("feature_importance.png", dpi=300)
 plt.close()
+print("Saved: feature_importance.png")
 
-# ==============================================================================
-# 4. UNIFIED ACS PARITY PLOT GENERATION
-# ==============================================================================
-sns.set_theme(style="ticks")
-plt.rcParams['font.family'] = 'sans-serif'
-plt.rcParams['font.weight'] = 'bold'
-plt.rcParams['axes.labelweight'] = 'bold'
-plt.rcParams['axes.titleweight'] = 'bold'
-plt.rcParams['axes.edgecolor'] = '#000000'
-plt.rcParams['axes.linewidth'] = 1.0
+# ---- 4c. Random Forest parity plot ----------------------------------
+y_pred_rf = preds["Random Forest Regressor"]
+r2_rf = r2_score(y_test, y_pred_rf)
 
-def plot_acs_unified_parity(y_true, y_pred, title, filename, r2_score_val, point_color, line_color, ylabel='Predicted Gap (eV)'):
-    fig, ax = plt.subplots(figsize=(3.5, 3.2), dpi=300)
-    ax.scatter(y_true, y_pred, color=point_color, alpha=0.50, s=16, edgecolors='black', linewidths=0.2, rasterized=True)
-    
-    min_val = min(np.min(y_true), np.min(y_pred))
-    max_val = max(np.max(y_true), np.max(y_pred))
-    line_range = np.linspace(min_val, max_val, 100)
-    ax.plot(line_range, line_range, color=line_color, linestyle='--', linewidth=1.8, label=r'$\mathbf{Ideal\ Fit}$', zorder=5)
-    
-    ax.text(
-        0.05, 0.90,
-        rf"$\mathbf{{R^2 = {r2_score_val:.3f}}}$",
-        transform=ax.transAxes,
-        fontsize=9,
-        fontweight='bold',
-        verticalalignment='top',
-        bbox=dict(boxstyle='square,pad=0.3', facecolor='white', edgecolor='#000000', linewidth=0.8, alpha=0.95)
-    )
-
-    ax.set_xlabel('DFT HOMO-LUMO Gap (eV)', fontsize=9, fontweight='bold', labelpad=6)
-    ax.set_ylabel(ylabel, fontsize=9, fontweight='bold', labelpad=6)
-    ax.set_title(title, fontsize=10, fontweight='bold', pad=8)
-    ax.tick_params(axis='both', which='major', labelsize=8, width=1.0, length=4)
-    ax.grid(True, linestyle=':', alpha=0.5, color='#888888')
-    ax.legend(loc='lower right', frameon=True, facecolor='white', framealpha=0.9, prop={'weight':'bold', 'size':8})
-
-    for spine in ax.spines.values():
-        spine.set_linewidth(1.0)
-        spine.set_color('#000000')
-
-    plt.tight_layout()
-    plt.savefig(filename, dpi=300, bbox_inches='tight')
-    plt.close()
-
-y_pred_real = xgb_model.predict(X_test)
-plot_acs_unified_parity(
-    y_test, 
-    y_pred_real, 
-    "Baseline Tabular", 
-    "real_parity_plot.png", 
-    r2_score(y_test, y_pred_real), 
-    '#1f77b4', 
-    '#d62728',
-    ylabel='XGBoost Predicted Gap (eV)'
+fig, ax = plt.subplots(figsize=(3.5, 3.2), dpi=300)
+ax.scatter(
+    y_test, y_pred_rf,
+    color="#1f77b4", alpha=0.50, s=16,
+    edgecolors="black", linewidths=0.2, rasterized=True,
 )
+lo = min(y_test.min(), y_pred_rf.min())
+hi = max(y_test.max(), y_pred_rf.max())
+ax.plot([lo, hi], [lo, hi], color="#d62728", linestyle="--",
+        linewidth=1.8, label=r"$\mathbf{Ideal\ Fit}$", zorder=5)
+ax.text(
+    0.05, 0.90,
+    rf"$\mathbf{{R^2 = {r2_rf:.3f}}}$",
+    transform=ax.transAxes, fontsize=9, fontweight="bold",
+    verticalalignment="top",
+    bbox=dict(boxstyle="square,pad=0.3", facecolor="white",
+              edgecolor="#000000", linewidth=0.8, alpha=0.95),
+)
+ax.set_xlabel("DFT HOMO-LUMO Gap (eV)", fontsize=9, fontweight="bold", labelpad=6)
+ax.set_ylabel("RF Predicted Gap (eV)", fontsize=9, fontweight="bold", labelpad=6)
+ax.set_title("Random Forest Parity", fontsize=10, fontweight="bold", pad=8)
+ax.tick_params(axis="both", which="major", labelsize=8, width=1.0, length=4)
+ax.grid(True, linestyle=":", alpha=0.5, color="#888888")
+ax.legend(loc="lower right", frameon=True, facecolor="white",
+          framealpha=0.9, prop={"weight": "bold", "size": 8})
+for spine in ax.spines.values():
+    spine.set_linewidth(1.0)
+    spine.set_color("#000000")
+plt.tight_layout()
+plt.savefig("real_parity_plot.png", dpi=300, bbox_inches="tight")
+plt.close()
+print("Saved: real_parity_plot.png")
 
-print("\nPipeline execution complete. All figures and model benchmarks generated successfully.")
+print()
+print("Pipeline execution complete.")
