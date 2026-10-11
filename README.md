@@ -40,12 +40,7 @@ All three models were trained on an identical 80/20 train/test split (`random_st
 ├── run_pipeline.py                 # Main execution pipeline (Steps 1–4)
 ├── requirements.txt                # Python dependencies
 ├── LICENSE
-├── README.md
-└── supplementary/                  # XGBoost feature-engineering ablation figures
-    ├── polynomial_features.png
-    ├── nonlinear_features.png
-    ├── filtered_tabular.png
-    └── coulomb_spectrum.png
+└── README.md
 ```
 
 ## Reproducing the Results
