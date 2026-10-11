@@ -75,6 +75,20 @@ If you use this code, please cite:
 
 > Kashan. *Benchmarking Machine Learning Models for HOMO–LUMO Gap Prediction in the tmQM Complex Dataset.* (in review).
 
+## Figures
+
+### Feature Correlation Matrix
+
+![Feature correlation matrix](tmqm_correlation_matrix.png)
+
+### Random Forest Feature Importance
+
+![Random Forest feature importance](feature_importance.png)
+
+### Random Forest Parity Plot
+
+![Random Forest parity plot](real_parity_plot.png)
+
 ## License
 
 See LICENSE file.
